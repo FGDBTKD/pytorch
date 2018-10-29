@@ -48,7 +48,7 @@ Analysis analyzeNet(const NetDef& net) {
 
 static void rewriteInput(OperatorDef* op, int i) {
   auto input = op->input(i);
-  op->set_input(i, input + "_I");
+  op->set_input(i, input + "_M");
 }
 
 static void rewriteOutput(OperatorDef* op, int i) {
@@ -56,22 +56,15 @@ static void rewriteOutput(OperatorDef* op, int i) {
   op->set_output(i, output + "_M");
 }
 
-static void insertInputCopyToMPSCNNOp(
-    NetDef& predictNet,
-    const std::string& cpu_blob) {
-  auto* op = predictNet.add_op();
-  op->set_type("CopyToMPSCNN");
-  op->add_input(cpu_blob);
-  op->add_output(cpu_blob + "_I");
-}
-
 static void insertOutputCopyFromMPSCNNOp(
     NetDef& predictNet,
-    const std::string& cpu_blob) {
+    const std::vector<std::string>& cpu_blobs) {
   auto* op = predictNet.add_op();
   op->set_type("CopyFromMPSCNN");
-  op->add_input(cpu_blob + "_M");
-  op->add_output(cpu_blob);
+  for (int i = 0; i < cpu_blobs.size(); ++i) {
+    op->add_input(cpu_blobs[i] + "_M");
+    op->add_output(cpu_blobs[i]);
+  }
 }
 
 NetDef insertInputOutputCopyOps(const NetDef& def) {
@@ -120,14 +113,21 @@ NetDef insertInputOutputCopyOps(const NetDef& def) {
       CAFFE_ENFORCE_EQ(op->input(0), def.external_input(0));
       op->set_input(0, "__METAL_INPUT_COPY__");
     }
-    // rewrite input
+    /*
+     * Let's say we have a Blob called "X" that is both the external output
+     * and will be used in the later operators. And it's on Metal. First, we'll
+     * rename the output of the operator to "X_M", therefore all the following
+     * operators that referenced this blob will need to change the input name
+     * and then we will copy "X_M" to CPU as "X" in the end.
+     *
+     */
     for (auto j = 0; j < op->input_size(); ++j) {
       if (output_set.find(op->input(j)) != output_set.end()) {
-        insertInputCopyToMPSCNNOp(mdef, op->input(j));
         rewriteInput(op, j);
+        // we'll add one CopyFromMPSCNN operator in the end
+        // to copy all the output blobs from MPSCNN to CPU
       }
     }
-
     // if the output is in external output, copy from metal when necessary
     for (auto j = 0; j < op->output_size(); ++j) {
       for (auto k = 0; k < def.external_output_size(); ++k) {
@@ -135,13 +135,19 @@ NetDef insertInputOutputCopyOps(const NetDef& def) {
         // of the blob is used as the output
         if (op->output(j) == def.external_output(k)) {
           output_set.insert(op->output(j));
-          insertOutputCopyFromMPSCNNOp(mdef, op->output(j));
           // rewrite output to output_M for the operator
           rewriteOutput(op, j);
         }
       }
     }
   }
+
+  // We copy all the output from Metal to CPU at once in the end
+  std::vector<std::string> external_outputs;
+  for (int i = 0; i < def.external_output_size(); ++i) {
+    external_outputs.push_back(def.external_output(i));
+  }
+  insertOutputCopyFromMPSCNNOp(mdef, external_outputs);
 
   return mdef;
 }

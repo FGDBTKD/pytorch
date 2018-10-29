@@ -172,10 +172,10 @@ class ConvPoolOpBase : public Operator<Context> {
     vector<int> dims;
     switch (order_) {
       case StorageOrder::NCHW:
-        dims.assign(input.dims().begin() + 2, input.dims().end());
+        dims.assign(input.sizes().begin() + 2, input.sizes().end());
         break;
       case StorageOrder::NHWC:
-        dims.assign(input.dims().begin() + 1, input.dims().end() - 1);
+        dims.assign(input.sizes().begin() + 1, input.sizes().end() - 1);
         break;
       default:
         CAFFE_THROW("Unknown storage order : ", order_);
@@ -189,15 +189,15 @@ class ConvPoolOpBase : public Operator<Context> {
     switch (order_) {
       case StorageOrder::NCHW:
         size = std::accumulate(
-            input.dims().begin() + 2,
-            input.dims().end(),
+            input.sizes().begin() + 2,
+            input.sizes().end(),
             1,
             std::multiplies<int>());
         break;
       case StorageOrder::NHWC:
         size = std::accumulate(
-            input.dims().begin() + 1,
-            input.dims().end() - 1,
+            input.sizes().begin() + 1,
+            input.sizes().end() - 1,
             1,
             std::multiplies<int>());
         break;
@@ -221,7 +221,7 @@ class ConvPoolOpBase : public Operator<Context> {
     int N = input.dim32(0);
     bool channel_first;
     InferOutputSize(
-        input.dims(),
+        input.sizes(),
         output_channel,
         order_,
         global_pooling_,
@@ -246,7 +246,7 @@ class ConvPoolOpBase : public Operator<Context> {
   // Helper function that is also called from OperatorSchema. Modified
   // kernel parameters and output output_dims and channel_first.
   static inline void InferOutputSize(
-      vector<int64_t> input_dims,
+      at::IntList input_dims,
       int /*output_channel*/,
       StorageOrder order,
       bool global_pooling,

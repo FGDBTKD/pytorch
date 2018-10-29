@@ -5,7 +5,7 @@
 #include "caffe2/core/operator.h"
 #include "caffe2/core/scope_guard.h"
 
-CAFFE2_DECLARE_bool(caffe2_disable_chaining);
+C10_DECLARE_bool(caffe2_disable_chaining);
 
 namespace caffe2 {
 
