@@ -18,6 +18,7 @@ import warnings
 import random
 import contextlib
 import socket
+import time
 from collections import OrderedDict
 from functools import wraps
 from itertools import product
@@ -77,12 +78,13 @@ def _check_module_exists(name):
             return True
         except ImportError:
             return False
-    elif PY34:  # Python [3, 3.4)
+    elif not PY34:  # Python [3, 3.4)
         import importlib
         loader = importlib.find_loader(name)
         return loader is not None
     else:  # Python >= 3.4
         import importlib
+        import importlib.util
         spec = importlib.util.find_spec(name)
         return spec is not None
 
@@ -176,7 +178,10 @@ def to_gpu(obj, type_map={}):
 
 
 def get_function_arglist(func):
-    return inspect.getargspec(func).args
+    if sys.version_info > (3,):
+        return inspect.getfullargspec(func).args
+    else:
+        return inspect.getargspec(func).args
 
 
 def set_rng_seed(seed):
@@ -239,10 +244,17 @@ class CudaMemoryLeakCheck():
         if exec_type is not None:
             return
         afters = self.get_cuda_memory_usage()
+
         for i, (before, after) in enumerate(zip(self.befores, afters)):
-            self.testcase.assertEqual(
-                before, after, '{} leaked {} bytes CUDA memory on device {}'.format(
-                    self.name, after - before, i))
+            if not TEST_WITH_ROCM:
+                self.testcase.assertEqual(
+                    before, after, '{} leaked {} bytes CUDA memory on device {}'.format(
+                        self.name, after - before, i))
+            else:
+                # TODO: Investigate ROCm memory leaking.
+                if before != after:
+                    warnings.warn('{} leaked {} bytes ROCm memory on device {}'.format(
+                        self.name, after - before, i), RuntimeWarning)
 
 
 class TestCase(expecttest.TestCase):
@@ -315,7 +327,8 @@ class TestCase(expecttest.TestCase):
             #        needed for inplace operations done on `x`, e.g., copy_().
             #        Remove after implementing something equivalent to CopySlice
             #        for sparse views.
-            x = x.detach()
+            # NOTE: We do clone() after detach() here because we need to be able to change size/storage of x afterwards
+            x = x.detach().clone()
         return x, x._indices().clone(), x._values().clone()
 
     def safeToDense(self, t):
@@ -628,6 +641,25 @@ def find_free_port():
     return sockname[1]
 
 
+def retry_on_address_already_in_use_error(func):
+    """Reruns a test if it sees "Address already in use" error."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        tries_remaining = 10
+        while True:
+            try:
+                return func(*args, **kwargs)
+            except RuntimeError as error:
+                if str(error) == "Address already in use":
+                    tries_remaining -= 1
+                    if tries_remaining == 0:
+                        raise
+                    time.sleep(random.random())
+                    continue
+                raise
+    return wrapper
+
+
 # Methods for matrix generation
 # Used in test_autograd.py and test_torch.py
 def prod_single_zero(dim_size):
@@ -661,9 +693,9 @@ def random_symmetric_psd_matrix(l):
     return A.mm(A.transpose(0, 1))
 
 
-def random_symmetric_pd_matrix(l, eps=1e-5):
-    A = torch.randn(l, l)
-    return A.mm(A.transpose(0, 1)) + torch.eye(l) * eps
+def random_symmetric_pd_matrix(l, *batches):
+    A = torch.randn(*(batches + (l, l)))
+    return A.matmul(A.transpose(-2, -1)) + torch.eye(l) * 1e-5
 
 
 def make_nonzero_det(A, sign=None, min_singular_value=0.1):
@@ -677,7 +709,11 @@ def make_nonzero_det(A, sign=None, min_singular_value=0.1):
     return A
 
 
-def random_fullrank_matrix_distinct_singular_value(l, *batches):
+def random_fullrank_matrix_distinct_singular_value(l, *batches, **kwargs):
+    silent = kwargs.get("silent", False)
+    if silent and not torch._C.has_lapack:
+        return torch.ones(l, l)
+
     if len(batches) == 0:
         A = torch.randn(l, l)
         u, _, v = A.svd()
@@ -691,6 +727,20 @@ def random_fullrank_matrix_distinct_singular_value(l, *batches):
             s = torch.arange(1., l + 1).mul_(1.0 / (l + 1))
             all_matrices.append(u.mm(torch.diag(s)).mm(v.t()))
         return torch.stack(all_matrices).reshape(*(batches + (l, l)))
+
+
+def brute_pdist(inp, p=2):
+    """Computes the same as torch.pdist using primitives"""
+    n = inp.shape[-2]
+    k = n * (n - 1) // 2
+    if k == 0:
+        # torch complains about empty indices
+        return torch.empty(inp.shape[:-2] + (0,), device=inp.device)
+    square = torch.norm(inp[..., None, :] - inp[..., None, :, :], p=p, dim=-1)
+    unroll = square.view(square.shape[:-2] + (n * n,))
+    inds = torch.ones(k, dtype=torch.int)
+    inds[torch.arange(n - 1, 1, -1, dtype=torch.int).cumsum(0)] += torch.arange(2, n, dtype=torch.int)
+    return unroll[..., inds.cumsum(0)]
 
 
 def do_test_dtypes(self, dtypes, layout, device):
@@ -779,6 +829,35 @@ THESE_TAKE_WAY_TOO_LONG = {
     'test_multinomial_invalid_probs',
 }
 
+
+running_script_path = None
+
+
+def set_running_script_path():
+    global running_script_path
+    try:
+        running_file = os.path.abspath(os.path.realpath(sys.argv[0]))
+        if running_file.endswith('.py'):  # skip if the running file is not a script
+            running_script_path = running_file
+    except Exception:
+        pass
+
+
+def check_test_defined_in_running_script(test_case):
+    if running_script_path is None:
+        return
+    if TEST_WITH_ROCM:
+        # In ROCm CI, to avoid forking after HIP is initialized, we
+        # indeed load test module from test/run_test.py and run all
+        # tests in the same process.
+        return
+    test_case_class_file = os.path.abspath(os.path.realpath(inspect.getfile(test_case.__class__)))
+    assert test_case_class_file == running_script_path, "Class of loaded TestCase \"{}\" " \
+        "is not defined in the running script \"{}\", but in \"{}\". Did you " \
+        "accidentally import a unittest.TestCase from another file?".format(
+            test_case.id(), running_script_path, test_case_class_file)
+
+
 num_shards = os.environ.get('TEST_NUM_SHARDS', None)
 shard = os.environ.get('TEST_SHARD', None)
 if num_shards is not None and shard is not None:
@@ -786,9 +865,11 @@ if num_shards is not None and shard is not None:
     shard = int(shard)
 
     def load_tests(loader, tests, pattern):
+        set_running_script_path()
         test_suite = unittest.TestSuite()
         for test_group in tests:
             for test in test_group:
+                check_test_defined_in_running_script(test)
                 name = test.id().split('.')[-1]
                 if name in THESE_TAKE_WAY_TOO_LONG:
                     continue
@@ -797,4 +878,12 @@ if num_shards is not None and shard is not None:
                     test_suite.addTest(test)
         return test_suite
 else:
-    load_tests = None
+
+    def load_tests(loader, tests, pattern):
+        set_running_script_path()
+        test_suite = unittest.TestSuite()
+        for test_group in tests:
+            for test in test_group:
+                check_test_defined_in_running_script(test)
+                test_suite.addTest(test)
+        return test_suite

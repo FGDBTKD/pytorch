@@ -6,7 +6,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "caffe2/contrib/script/compiler.h"
 #include "caffe2/core/asan.h"
 #include "caffe2/core/blob_stats.h"
 #include "caffe2/core/db.h"
@@ -355,7 +354,7 @@ void addObjectMethods(py::module& m) {
               auto feeder = CreateFeeder(option.device_type());
               CAFFE_ENFORCE(
                   feeder, "Unknown device type encountered in FeedBlob.");
-              feeder->Feed(option, array, blob);
+              feeder->Feed(option, array, blob, true); /* default to inplace feed */
               return true;
             }
 #else
@@ -415,7 +414,7 @@ void addObjectMethods(py::module& m) {
       .def_property_readonly(
           "data",
           [](TensorCPU* t) -> py::object {
-            if (t->meta() == TypeMeta{}) {
+            if (t->dtype() == TypeMeta{}) {
               // keep this behavior for backward compatibility
               t->mutable_data<float>();
             }
@@ -432,8 +431,8 @@ void addObjectMethods(py::module& m) {
               CAFFE_THROW(
                   "Unexpected type of argument -- expected numpy array");
             }
-            TensorFeeder<CPUContext>().FeedTensor(
-                DeviceOption{}, reinterpret_cast<PyArrayObject*>(obj.ptr()), t);
+            *t = TensorFeeder<CPUContext>().FeedTensor(
+                DeviceOption{}, reinterpret_cast<PyArrayObject*>(obj.ptr()));
 #else
             CAFFE_THROW("Caffe2 compiled without NumPy support.");
 #endif // USE_NUMPY
@@ -460,7 +459,7 @@ void addObjectMethods(py::module& m) {
           "Initialize this tensor to given shape and data type. "
           "Fail if the given data type cannot be accessed from python.")
       .def_property_readonly(
-          "_shape", [](const TensorCPU& t) { return t.dims().vec(); })
+          "_shape", [](const TensorCPU& t) { return t.sizes().vec(); })
       .def("_reshape", [](TensorCPU* t, std::vector<int64_t> dims) {
         t->Resize(dims);
       });
@@ -751,15 +750,15 @@ void addObjectMethods(py::module& m) {
             for (const auto pair : inputs) {
               const auto& name = pair.first;
               const auto& input = pair.second;
-              tensors_data.emplace(name, Tensor(CPU));
 #ifdef USE_NUMPY
               CAFFE_ENFORCE(
                   PyArray_Check(input.ptr()),
                   "Input must be of type numpy array.");
               PyArrayObject* array =
                   reinterpret_cast<PyArrayObject*>(input.ptr());
-              TensorFeeder<CPUContext>().FeedTensor(
-                  DeviceOption(), array, &tensors_data.at(name));
+              tensors_data.emplace(
+                  name,
+                  TensorFeeder<CPUContext>().FeedTensor(DeviceOption(), array));
 #else
               CAFFE_THROW("Caffe2 was compiled without NumPy support.");
 #endif // USE_NUMPY
@@ -777,9 +776,6 @@ void addObjectMethods(py::module& m) {
           [](caffe2::onnx::Caffe2BackendRep& instance,
              std::vector<py::object> inputs) -> std::vector<py::object> {
             std::vector<TensorCPU> tensors_data;
-            for (auto i = 0; i < inputs.size(); ++i) {
-              tensors_data.emplace_back(caffe2::CPU);
-            }
 #ifdef USE_NUMPY
             for (auto i = 0; i < inputs.size(); ++i) {
               auto input = inputs[i];
@@ -788,8 +784,8 @@ void addObjectMethods(py::module& m) {
                   "Input must be of type numpy array.");
               PyArrayObject* array =
                   reinterpret_cast<PyArrayObject*>(input.ptr());
-              TensorFeeder<CPUContext>().FeedTensor(
-                  DeviceOption(), array, &(tensors_data[i]));
+              tensors_data.push_back(
+                  TensorFeeder<CPUContext>().FeedTensor(DeviceOption(), array));
             }
 #else
             CAFFE_THROW("Caffe2 was compiled without NumPy support.");
@@ -890,9 +886,6 @@ void addObjectMethods(py::module& m) {
           [](Predictor& instance,
              std::vector<py::object> inputs) -> std::vector<py::object> {
             std::vector<Tensor> tensors_data;
-            for (auto i = 0; i < inputs.size(); ++i) {
-              tensors_data.emplace_back(CPU);
-            }
 #ifdef USE_NUMPY
             for (auto i = 0; i < inputs.size(); ++i) {
               auto input = inputs[i];
@@ -901,8 +894,8 @@ void addObjectMethods(py::module& m) {
                   "Input must be of type numpy array.");
               PyArrayObject* array =
                   reinterpret_cast<PyArrayObject*>(input.ptr());
-              TensorFeeder<CPUContext>().FeedTensor(
-                  DeviceOption(), array, &(tensors_data[i]));
+              tensors_data.push_back(
+                  TensorFeeder<CPUContext>().FeedTensor(DeviceOption(), array));
             }
 #else
             CAFFE_THROW("Caffe2 was compiled without NumPy support.");
@@ -924,14 +917,14 @@ void addObjectMethods(py::module& m) {
             for (const auto pair : inputs) {
               const auto& name = pair.first;
               const auto& input = pair.second;
-              tensors_data.emplace(name, Tensor(CPU));
               CAFFE_ENFORCE(
                   PyArray_Check(input.ptr()),
                   "Input must be of type numpy array.");
               PyArrayObject* array =
                   reinterpret_cast<PyArrayObject*>(input.ptr());
-              TensorFeeder<CPUContext>().FeedTensor(
-                  DeviceOption(), array, &tensors_data.at(name));
+              tensors_data.emplace(
+                  name,
+                  TensorFeeder<CPUContext>().FeedTensor(DeviceOption(), array));
             }
 #else
             CAFFE_THROW("Caffe2 was compiled without NumPy support.");
@@ -944,29 +937,6 @@ void addObjectMethods(py::module& m) {
             }
             return pyout;
           });
-
-  py::class_<script::CompilationUnit>(m, "CompilationUnit")
-      .def(py::init<>())
-      .def("define", &script::CompilationUnit::define)
-      .def("get_proto", &script::CompilationUnit::getProto)
-      .def(
-          "create_net",
-          [](script::CompilationUnit* self, const std::string& name) {
-            auto net = self->createNet(gWorkspace, name);
-            CAFFE_ENFORCE(net);
-            return net;
-          })
-      .def(
-          "extern",
-          [](script::CompilationUnit* self,
-             const std::string& name,
-             py::object py_proto) {
-            py::bytes bytes = py_proto.attr("SerializeToString")();
-            std::unique_ptr<caffe2::NetDef> proto(new NetDef());
-            CAFFE_ENFORCE(ParseProtoFromLargeString(
-                bytes.cast<std::string>(), proto.get()));
-            self->defineExtern(name, std::move(proto));
-          });
 }
 
 void addGlobalMethods(py::module& m) {
@@ -977,12 +947,12 @@ void addGlobalMethods(py::module& m) {
   // keep this Python attribute for BC
   m.attr("has_mkldnn") = py::bool_(false);
 
-  m.attr("use_ideep") = py::bool_(
-#ifdef CAFFE2_USE_IDEEP
+  m.attr("use_mkldnn") = py::bool_(
+#ifdef CAFFE2_USE_MKLDNN
       true
-#else // CAFFE2_USE_IDEEP
+#else // CAFFE2_USE_MKLDNN
       false
-#endif // CAFFE2_USE_IDEEP
+#endif // CAFFE2_USE_MKLDNN
       );
 
   m.attr("use_trt") = py::bool_(
@@ -1637,7 +1607,8 @@ void addGlobalMethods(py::module& m) {
          const std::vector<std::string>& external_inputs,
          const std::unordered_map<std::string, std::vector<int>>& shapes,
          bool infer_shapes,
-         bool debug_builder) -> py::bytes {
+         bool debug_builder,
+         bool use_onnx) -> py::bytes {
         caffe2::NetDef pred_net;
         CAFFE_ENFORCE(
             ParseProtoFromLargeString(
@@ -1648,9 +1619,17 @@ void addGlobalMethods(py::module& m) {
           tensor_shapes.emplace(
               it.first, CreateTensorShape(it.second, TensorProto::FLOAT));
         }
-        OnnxifiTransformer ts(infer_shapes, debug_builder);
+        OnnxifiTransformerOptions opts;
+        opts.infer_shapes = infer_shapes;
+        opts.debug = debug_builder;
+        opts.use_onnx = use_onnx;
+        OnnxifiTransformer ts(opts);
         ts.Transform(
-            GetCurrentWorkspace(), &pred_net, external_inputs, tensor_shapes);
+            GetCurrentWorkspace(),
+            &pred_net,
+            external_inputs,
+            tensor_shapes,
+            std::unordered_set<int>());
         std::string pred_net_str2;
         pred_net.SerializeToString(&pred_net_str2);
         return py::bytes(pred_net_str2);

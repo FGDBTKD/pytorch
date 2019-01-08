@@ -1,26 +1,16 @@
 #pragma once
 
 #include <torch/arg.h>
-#include <torch/tensor.h>
+#include <torch/types.h>
 
 #include <chrono>
 #include <cstddef>
 
 namespace torch {
 namespace data {
-namespace detail {
-struct FullDataLoaderOptions;
-} // namespace detail
-} // namespace data
-} // namespace torch
-
-namespace torch {
-namespace data {
 
 /// Options to configure a `DataLoader`.
 struct DataLoaderOptions {
-  friend struct torch::data::detail::FullDataLoaderOptions;
-
   DataLoaderOptions() = default;
   /* implicit */ DataLoaderOptions(size_t batch_size)
       : batch_size_(batch_size) {}

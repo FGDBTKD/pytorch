@@ -1,13 +1,13 @@
-#include "torch/csrc/python_headers.h"
+#include <torch/csrc/python_headers.h>
 
-#include "torch/csrc/DynamicTypes.h"
-#include "torch/csrc/Dtype.h"
-#include "torch/csrc/Layout.h"
-#include "torch/csrc/PythonTypes.h"
-#include "torch/csrc/Exceptions.h"
-#include "torch/csrc/autograd/generated/VariableType.h"
-#include "torch/csrc/utils/cuda_enabled.h"
-#include "torch/csrc/utils/cuda_lazy_init.h"
+#include <torch/csrc/DynamicTypes.h>
+#include <torch/csrc/Dtype.h>
+#include <torch/csrc/Layout.h>
+#include <torch/csrc/PythonTypes.h>
+#include <torch/csrc/Exceptions.h>
+#include <torch/csrc/autograd/generated/VariableType.h>
+#include <torch/csrc/utils/cuda_enabled.h>
+#include <torch/csrc/utils/cuda_lazy_init.h>
 
 #include <ATen/ATen.h>
 
@@ -72,7 +72,7 @@ PyTypeObject* getPyTypeObject(const at::Storage& storage)
 {
   auto attype = at::globalContext().getNonVariableTypeOpt(
       at::deviceTypeToBackend(storage.device_type()),
-      at::dataTypeToScalarType(storage.dtype().id()));
+      at::typeMetaToScalarType(storage.dtype()));
   auto it = attype_to_py_storage_type.find(attype);
   if (it != attype_to_py_storage_type.end()) {
     return it->second;

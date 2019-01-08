@@ -1,5 +1,6 @@
 #pragma once
 
+#include <assert.h>
 #include <ATen/ATen.h>
 #include <ATen/cuda/Array.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -9,7 +10,11 @@
 #include <THC/THCGeneral.hpp>
 #include <ATen/native/TensorIterator.h>
 #include <ATen/native/cuda/Loops.cuh>
+#include <functional>
 #include <iosfwd>
+#include <tuple>
+#include <type_traits>
+#include <utility>
 
 namespace at { namespace native {
 
@@ -60,25 +65,25 @@ struct ReduceConfig {
     return dim3(div_up(num_outputs, step_output), ctas_per_output);
   }
 
-  AT_HOST_DEVICE bool should_warp_reduce() const {
+  C10_HOST_DEVICE bool should_warp_reduce() const {
     return input_mult[LANE] != 0;
   }
 
-  AT_HOST_DEVICE bool should_block_reduce() const {
+  C10_HOST_DEVICE bool should_block_reduce() const {
     return input_mult[WARP] != 0;
   }
 
-  AT_HOST_DEVICE bool should_global_reduce() const {
+  C10_HOST_DEVICE bool should_global_reduce() const {
     return input_mult[CTA] != 0;
   }
 
-  AT_DEVICE bool should_store(int output_idx) const {
+  C10_DEVICE bool should_store(int output_idx) const {
     return output_idx < num_outputs &&
       (!should_warp_reduce() || threadIdx.x == 0) &&
       (!should_block_reduce() || threadIdx.y == 0);
   }
 
-  AT_HOST_DEVICE int input_idx() const {
+  C10_HOST_DEVICE int input_idx() const {
     int lane = threadIdx.x;
     int warp = threadIdx.y;
     int cta2 = blockIdx.y;
@@ -87,7 +92,7 @@ struct ReduceConfig {
             cta2 * input_mult[CTA]);
   }
 
-  AT_HOST_DEVICE int output_idx() const {
+  C10_HOST_DEVICE int output_idx() const {
     int lane = threadIdx.x;
     int warp = threadIdx.y;
     int cta1 = blockIdx.x;
@@ -96,11 +101,11 @@ struct ReduceConfig {
             cta1 * step_output);
   }
 
-  AT_DEVICE int shared_memory_offset(int offset) const {
+  C10_DEVICE int shared_memory_offset(int offset) const {
     return threadIdx.x + (threadIdx.y + offset) * blockDim.x;
   }
 
-  AT_DEVICE int staging_memory_offset(int cta2) const {
+  C10_DEVICE int staging_memory_offset(int cta2) const {
     int offset = cta2 + blockIdx.x * gridDim.y;
     if (!should_warp_reduce()) {
       offset = threadIdx.x + offset * blockDim.x;
@@ -115,11 +120,15 @@ struct ReduceConfig {
     return element_size_bytes * NUM_THREADS;
   }
 
-  int global_memory_size() const {
+  int64_t global_memory_size() const {
     if (!should_global_reduce()) {
       return 0;
     }
-    return element_size_bytes * num_outputs * ctas_per_output;
+    auto size = (int64_t)element_size_bytes * num_outputs * ctas_per_output;
+    if (!should_warp_reduce()) {
+      size *= block().x;
+    }
+    return size;
   }
 
   int semaphore_size() const {
@@ -142,7 +151,8 @@ __global__ void reduce_kernel(R reduction) {
   reduction.run();
 }
 
-static OffsetCalculator<2> make_output_calculator(const TensorIterator& iter) {
+template <typename index_t>
+static OffsetCalculator<2, index_t> make_output_calculator(const TensorIterator& iter) {
   int num_reduce_dims = iter.num_reduce_dims();
   int num_output_dims = iter.ndim() - num_reduce_dims;
   std::array<const int64_t*, 2> strides = {
@@ -150,28 +160,29 @@ static OffsetCalculator<2> make_output_calculator(const TensorIterator& iter) {
     iter.strides(1).data() + num_reduce_dims,
   };
   auto shape = iter.shape().data() + num_reduce_dims;
-  return OffsetCalculator<2>(num_output_dims, shape, strides.data());
+  return OffsetCalculator<2, index_t>(num_output_dims, shape, strides.data());
 }
 
-static OffsetCalculator<1> make_input_calculator(const TensorIterator& iter) {
+template <typename index_t>
+static OffsetCalculator<1, index_t> make_input_calculator(const TensorIterator& iter) {
   int num_reduce_dims = iter.num_reduce_dims();
   std::array<const int64_t*, 1> strides = {
     iter.strides(1).data(),
   };
-  return OffsetCalculator<1>(num_reduce_dims, iter.shape().data(), strides.data());
+  return OffsetCalculator<1, index_t>(num_reduce_dims, iter.shape().data(), strides.data());
 }
 
-template <int vt, typename func_t>
-__device__ void strided_iterate(func_t f, int begin, int end, int stride) {
+template <int vt, typename index_t, typename func_t>
+__device__ void strided_iterate(func_t f, index_t begin, index_t end, index_t stride) {
   if (begin + (vt - 1) * stride < end) {
     #pragma unroll
-    for (int i = 0; i < vt; i++) {
+    for (index_t i = 0; i < vt; i++) {
       f(i, begin + i * stride);
     }
   } else {
     #pragma unroll
-    for (int i = 0; i < vt; i++) {
-      int idx = begin + i * stride;
+    for (index_t i = 0; i < vt; i++) {
+      index_t idx = begin + i * stride;
       if (idx < end) {
         f(i, idx);
       }
@@ -179,31 +190,56 @@ __device__ void strided_iterate(func_t f, int begin, int end, int stride) {
   }
 }
 
-template <int vt, typename type_t, typename foo_t>
-__device__ Array<type_t, vt> load_memory(const type_t* in, int begin, int end, int stride, foo_t foo) {
+template <int vt, typename index_t, typename type_t, typename foo_t>
+__device__ Array<type_t, vt> load_memory(const type_t* in, index_t begin, index_t end, index_t stride, foo_t foo) {
   Array<type_t, vt> res;
-  strided_iterate<vt>([&](int i, int idx) {
+  strided_iterate<vt>([&](index_t i, index_t idx) {
     res[i] = in[foo(idx)];
   }, begin, end, stride);
   return res;
 }
 
-template <int vt, typename type_t>
-__device__ Array<type_t, vt> load_memory(const type_t* in, int begin, int end, int stride) {
-  return load_memory<vt>(in, begin, end, stride, [](int idx) { return idx; });
+template <int vt, typename index_t, typename type_t>
+__device__ Array<type_t, vt> load_memory(const type_t* in, index_t begin, index_t end, index_t stride) {
+  return load_memory<vt, index_t>(in, begin, end, stride, [](index_t idx) { return idx; });
 }
 
-template <typename scalar_t, typename func_t>
-struct ReduceOp {
-  using traits = binary_function_traits<func_t>;
-  using arg_t = typename traits::arg2_t;
+template <typename out_scalar_t, typename func_t>
+struct func_wrapper_t {
+  using arg_t = typename binary_function_traits<func_t>::arg2_t;
+  func_t reduce;
+  func_t combine;
+  static inline __device__ out_scalar_t project(arg_t arg) {
+    return (out_scalar_t) arg;
+  }
+  static inline __device__ arg_t warp_shfl_down(arg_t arg, int offset) {
+    return WARP_SHFL_DOWN(arg, offset);
+  }
 
-  using InputCalculator = OffsetCalculator<1>;
-  using OutputCalculator = OffsetCalculator<2>;
+  func_wrapper_t(const func_t& op) : reduce(op), combine(op) {
+  }
+};
+
+template <typename scalar_t, typename func_t>
+func_wrapper_t<scalar_t, func_t> func_wrapper(const func_t& op) {
+  using arg_t = typename binary_function_traits<func_t>::arg2_t;
+  return func_wrapper_t<scalar_t, func_t> { op };
+}
+
+template <typename scalar_t, typename ops_t, typename index_t, typename out_scalar_t=scalar_t>
+struct ReduceOp {
+  using traits = binary_function_traits<decltype(&ops_t::reduce)>;
+  using arg_t = typename std::remove_const<typename std::remove_reference<typename traits::arg1_t>::type>::type;
+
+  using InputCalculator = OffsetCalculator<1, index_t>;
+  using OutputCalculator = OffsetCalculator<2, index_t>;
 
   static constexpr int vt0 = 4;
+  static constexpr bool can_accumulate_in_output =
+    std::is_convertible<arg_t, out_scalar_t>::value;
 
-  func_t op;
+
+  ops_t ops;
   arg_t ident;
   ReduceConfig config;
   InputCalculator input_calc;
@@ -214,21 +250,22 @@ struct ReduceOp {
   int* semaphores;
   bool accumulate;
 
-  ReduceOp(func_t op, ReduceConfig config, InputCalculator input_calc, OutputCalculator output_calc,
-           const void* src, void* dst, void* buffer, int* semaphores)
-    : op(op)
+  ReduceOp(ops_t ops, ReduceConfig config, InputCalculator input_calc, OutputCalculator output_calc,
+           const void* src, void* dst, void* buffer, int* semaphores, arg_t ident)
+    : ops(ops)
     , config(config)
     , input_calc(input_calc)
     , output_calc(output_calc)
     , src(src)
     , dst(dst)
     , buffer(buffer)
-    , semaphores(semaphores) {
+    , semaphores(semaphores)
+    , ident(ident) {
   }
 
-  AT_DEVICE void run() const {
-    int output_idx = config.output_idx();
-    int input_idx = config.input_idx();
+  C10_DEVICE void run() const {
+    index_t output_idx = config.output_idx();
+    index_t input_idx = config.input_idx();
     auto base_offsets = output_calc.get(output_idx);
 
     arg_t value = ident;
@@ -244,62 +281,62 @@ struct ReduceOp {
       value = warp_reduce(value);
     }
 
-    auto out = (scalar_t*)((char*)dst + base_offsets[0]);
+    auto out = (out_scalar_t*)((char*)dst + base_offsets[0]);
     if (config.should_global_reduce()) {
       value = global_reduce(value, out);
     } else if (config.should_store(output_idx)) {
       if (accumulate) {
-        value = op(*out, value);
+        value = accumulate_in_output<can_accumulate_in_output>(out, value);
       }
-      *out = value;
+      *out = ops.project(value);
     }
   }
 
-  AT_DEVICE Array<scalar_t, vt0> load_inputs(const scalar_t* data, int offset) const {
-    int end = config.num_inputs;
-    int stride = input_calc.strides_[0][0] / sizeof(scalar_t);
+  C10_DEVICE Array<scalar_t, vt0> load_inputs(const scalar_t* data, index_t offset) const {
+    index_t end = config.num_inputs;
+    index_t stride = input_calc.strides_[0][0] / sizeof(scalar_t);
     if (input_calc.dims == 1) {
-      return load_memory<vt0>(data, offset, end, config.step_input, [&](int idx) {
+      return load_memory<vt0, index_t>(data, offset, end, config.step_input, [&](index_t idx) {
         return idx * stride;
       });
     } else {
-      return load_memory<vt0>(data, offset, end, config.step_input, [&](int idx) {
+      return load_memory<vt0, index_t>(data, offset, end, config.step_input, [&](index_t idx) {
         return input_calc.get(idx)[0] / sizeof(scalar_t);
       });
     }
   }
 
-  AT_DEVICE arg_t thread_reduce_once(const scalar_t* data, int offset) const {
+  C10_DEVICE arg_t thread_reduce_once(const scalar_t* data, index_t offset) const {
     auto values = load_inputs(data, offset);
 
-    arg_t value;
-    strided_iterate<vt0>([&](int i, int idx) {
-      value = i == 0 ? (arg_t)values[0] : op(value, values[i]);
+    arg_t value = ident;
+    strided_iterate<vt0, index_t>([&](index_t i, index_t idx) {
+      value = ops.reduce(value, values[i]);
     }, offset, config.num_inputs, config.step_input);
 
     return value;
   }
 
-  AT_DEVICE arg_t thread_reduce(const scalar_t* data) const {
+  C10_DEVICE arg_t thread_reduce(const scalar_t* data) const {
     arg_t value = ident;
-    int idx = config.input_idx();
+    index_t idx = config.input_idx();
     while (idx < config.num_inputs) {
       arg_t next = thread_reduce_once(data, idx);
-      value = op(value, next);
+      value = ops.combine(value, next);
       idx += config.step_input * vt0;
     }
     return value;
   }
 
-  AT_DEVICE arg_t warp_reduce(arg_t value) const {
+  C10_DEVICE arg_t warp_reduce(arg_t value) const {
     for (int offset = 1; offset < warpSize; offset <<= 1) {
-      arg_t other = WARP_SHFL_DOWN(value, offset);
-      value = op(value, other);
+      arg_t other = ops.warp_shfl_down(value, offset);
+      value = ops.combine(value, other);
     }
     return value;
   }
 
-  AT_DEVICE arg_t block_reduce(arg_t value) const {
+  C10_DEVICE arg_t block_reduce(arg_t value) const {
     extern __shared__ char shared_memory[];
     arg_t* shared = (arg_t*)shared_memory;
     shared[config.shared_memory_offset(0)] = value;
@@ -308,16 +345,17 @@ struct ReduceOp {
       __syncthreads();
       if (threadIdx.y < offset && threadIdx.y + offset < num_warps) {
         arg_t other = shared[config.shared_memory_offset(offset)];
-        value = op(value, other);
+        value = ops.combine(value, other);
         shared[config.shared_memory_offset(0)] = value;
       }
     }
     return value;
   }
 
-  AT_DEVICE bool mark_block_finished() const {
+  C10_DEVICE bool mark_block_finished() const {
     extern __shared__ int is_last_block_done_shared[];
 
+    __syncthreads();
     if (threadIdx.x == 0 && threadIdx.y == 0) {
       int prev_blocks_finished = atomicAdd(&semaphores[blockIdx.x], 1);
       is_last_block_done_shared[0] = (prev_blocks_finished == gridDim.y - 1);
@@ -329,13 +367,33 @@ struct ReduceOp {
 
     return is_last_block_done;
   }
+  
+  template <bool can_acc>
+  C10_DEVICE arg_t accumulate_in_output(
+    out_scalar_t* out, arg_t value,
+    typename std::enable_if<can_acc>::type* = nullptr
+  ) const {
+    return ops.reduce(*out, value);
+  }
 
-  AT_DEVICE arg_t global_reduce(arg_t value, scalar_t* out) const {
+  // This function should never be called --
+  // it's the version of `accumulate_in_output`
+  // when accumulation in the output is not possible.
+  template <bool can_acc>
+  C10_DEVICE arg_t accumulate_in_output(
+    out_scalar_t*, arg_t,
+    typename std::enable_if<!can_acc>::type* = nullptr
+  ) const {
+    assert(false); // can't use AT_ASSERT in Cuda.
+    return arg_t {};
+  }
+
+  C10_DEVICE arg_t global_reduce(arg_t value, out_scalar_t* out) const {
     arg_t* reduce_buffer = (arg_t*)buffer;
 
     bool should_store = config.should_store(config.output_idx());
     if (should_store) {
-      int offset = config.staging_memory_offset(blockIdx.y);
+      index_t offset = config.staging_memory_offset(blockIdx.y);
       reduce_buffer[offset] = value;
     }
 
@@ -344,22 +402,22 @@ struct ReduceOp {
     bool is_last_block_done = mark_block_finished();
 
     if (is_last_block_done) {
-      value = 0;
+      value = ident;
       if (config.should_warp_reduce()) {
-        int input_offset = threadIdx.x + threadIdx.y * blockDim.x;
-        int step = blockDim.x * blockDim.y;
+        index_t input_offset = threadIdx.x + threadIdx.y * blockDim.x;
+        index_t step = blockDim.x * blockDim.y;
         for (; input_offset < config.ctas_per_output; input_offset += step) {
-          int idx = config.staging_memory_offset(input_offset);
+          index_t idx = config.staging_memory_offset(input_offset);
           arg_t next = reduce_buffer[idx];
-          value = op(value, next);
+          value = ops.combine(value, next);
         }
       } else {
-        int input_offset = threadIdx.y;
-        int step = blockDim.y;
+        index_t input_offset = threadIdx.y;
+        index_t step = blockDim.y;
         for (; input_offset < config.ctas_per_output; input_offset += step) {
-          int idx = config.staging_memory_offset(input_offset);
+          index_t idx = config.staging_memory_offset(input_offset);
           arg_t next = reduce_buffer[idx];
-          value = op(value, next);
+          value = ops.combine(value, next);
         }
       }
       value = block_reduce(value);
@@ -368,9 +426,9 @@ struct ReduceOp {
       }
       if (should_store) {
         if (accumulate) {
-          value = op(*out, value);
+          value = accumulate_in_output<can_accumulate_in_output>(out, value);
         }
-        *out = value;
+        *out = ops.project(value);
       }
     }
 
@@ -388,14 +446,19 @@ static void launch_reduce_kernel(const ReduceConfig& config, const R& reduction)
   AT_CUDA_CHECK(cudaGetLastError());
 }
 
-template <typename scalar_t, typename func_t, typename ident_t=double>
-inline void gpu_reduce_kernel(TensorIterator& iter, const func_t& op, ident_t ident=0) {
-  ASSERT_HOST_DEVICE_LAMBDA(func_t);
+template <typename scalar_t, typename out_scalar_t, typename ops_t, typename ident_t=double>
+inline void gpu_reduce_kernel(TensorIterator& iter, const ops_t& ops, ident_t ident=0) {
   AT_ASSERT(iter.numel() > 0 && iter.ntensors() == 2);
 
-  if (!iter.can_use_32bit_indexing()) {
+  using traits = binary_function_traits<decltype(&ops_t::reduce)>;
+  using arg_t = typename traits::arg1_t;
+  static constexpr bool can_accumulate_in_output =
+    std::is_convertible<arg_t, out_scalar_t>::value;
+
+  bool can_use_32bit_indexing = iter.can_use_32bit_indexing();
+  if (can_accumulate_in_output && !can_use_32bit_indexing) {
     for (auto& sub_iter : iter.with_32bit_indexing()) {
-      gpu_reduce_kernel<scalar_t>(sub_iter, op);
+      gpu_reduce_kernel<scalar_t, out_scalar_t>(sub_iter, ops, ident);
     }
     return;
   }
@@ -403,8 +466,6 @@ inline void gpu_reduce_kernel(TensorIterator& iter, const func_t& op, ident_t id
   char* out_data = (char*)iter.data_ptr(0);
   const char* in_data = (char*)iter.data_ptr(1);
 
-  using traits = binary_function_traits<func_t>;
-  using arg_t = typename traits::arg2_t;
 
   int warp_size = at::cuda::warp_size();
   int warps_per_cta = ReduceConfig::NUM_THREADS / warp_size;
@@ -414,7 +475,7 @@ inline void gpu_reduce_kernel(TensorIterator& iter, const func_t& op, ident_t id
   int64_t num_outputs = iter.num_output_elements();
   int64_t inputs_per_output = iter.numel() / num_outputs;
 
-  auto config = ReduceConfig(sizeof(scalar_t), num_outputs, inputs_per_output);
+  auto config = ReduceConfig(sizeof(arg_t), num_outputs, inputs_per_output);
 
   if (iter.ndim() == 0 || iter.strides(/*arg=*/1)[0] == sizeof(scalar_t)) {
     // Split the input across lanes if the input is contiguous in the reduced
@@ -447,9 +508,6 @@ inline void gpu_reduce_kernel(TensorIterator& iter, const func_t& op, ident_t id
     config.input_mult[2] = config.split_input(config.ctas_per_output);
   }
 
-  auto output_calc = make_output_calculator(iter);
-  auto input_calc = make_input_calculator(iter);
-
   at::DataPtr buffer;
   at::DataPtr semaphores;
   if (config.should_global_reduce()) {
@@ -460,19 +518,41 @@ inline void gpu_reduce_kernel(TensorIterator& iter, const func_t& op, ident_t id
     auto stream = at::cuda::getCurrentCUDAStream();
     AT_CUDA_CHECK(cudaMemsetAsync(semaphores.get(), 0, config.semaphore_size(), stream));
   }
-  auto reduce = ReduceOp<scalar_t, func_t>(
-      op,
-      config,
-      input_calc,
-      output_calc,
-      in_data,
-      out_data,
-      buffer.get(),
-      (int*)semaphores.get());
-  reduce.ident = ident;
-  reduce.accumulate = iter.should_accumulate();
 
-  launch_reduce_kernel<ReduceConfig::NUM_THREADS>(config, reduce);
+  if (can_use_32bit_indexing) {
+    auto output_calc = make_output_calculator<uint32_t>(iter);
+    auto input_calc = make_input_calculator<uint32_t>(iter);
+    auto reduce = ReduceOp<scalar_t, ops_t, uint32_t, out_scalar_t>(
+        ops,
+        config,
+        input_calc,
+        output_calc,
+        in_data,
+        out_data,
+        buffer.get(),
+        (int*)semaphores.get(),
+        ident);
+    reduce.accumulate = iter.should_accumulate();
+
+    launch_reduce_kernel<ReduceConfig::NUM_THREADS>(config, reduce);
+  } else {
+    auto output_calc = make_output_calculator<uint64_t>(iter);
+    auto input_calc = make_input_calculator<uint64_t>(iter);
+    auto reduce = ReduceOp<scalar_t, ops_t, uint64_t, out_scalar_t>(
+        ops,
+        config,
+        input_calc,
+        output_calc,
+        in_data,
+        out_data,
+        buffer.get(),
+        (int*)semaphores.get(),
+        ident);
+    AT_ASSERT(!iter.should_accumulate());
+    reduce.accumulate = false;
+
+    launch_reduce_kernel<ReduceConfig::NUM_THREADS>(config, reduce);
+  }
 }
 
 }} // namespace at::native

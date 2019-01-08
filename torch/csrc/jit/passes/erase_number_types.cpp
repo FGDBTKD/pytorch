@@ -1,11 +1,17 @@
-#include "torch/csrc/jit/passes/erase_number_types.h"
-#include "torch/csrc/jit/constants.h"
+#include <torch/csrc/jit/constants.h>
+#include <torch/csrc/jit/passes/erase_number_types.h>
 
-namespace torch { namespace jit {
+namespace torch {
+namespace jit {
 
 static void EraseNumberTypesOnBlock(Block* block) {
   for (auto it = block->nodes().begin(), end = block->nodes().end(); it != end;
        ++it) {
+    for (auto inp : it->inputs()) {
+      if (inp->type()->isSubtypeOf(NumberType::get())) {
+        inp->setType(DynamicType::get());
+      }
+    }
     for (auto sub : it->blocks()) {
       EraseNumberTypesOnBlock(sub);
     }
@@ -22,16 +28,16 @@ static void EraseNumberTypesOnBlock(Block* block) {
           it->output()->replaceAllUsesWith(r);
         }
       } break;
-      case prim::TensorToBool:
-      case prim::BoolToTensor:
-      case prim::TensorToNum:
+      case prim::Bool:
+      case prim::Float:
+      case prim::Int:
       case prim::ImplicitTensorToNum:
       case prim::NumToTensor: {
         it->output()->replaceAllUsesWith(it->inputs()[0]);
         // Let DCE cleanup
       } break;
       default: {
-        for(auto o : it->outputs()) {
+        for (auto o : it->outputs()) {
           if (o->type()->isSubtypeOf(NumberType::get())) {
             o->setType(CompleteTensorType::fromNumberType(o->type()));
           } else if (o->type()->isSubtypeOf(BoolType::get())) {
@@ -47,4 +53,5 @@ void EraseNumberTypes(const std::shared_ptr<Graph>& graph) {
   EraseNumberTypesOnBlock(graph->block());
 }
 
-}}
+} // namespace jit
+} // namespace torch
